@@ -111,66 +111,154 @@ def _extract_task_text(frame: Dict[str, Any]) -> str | None:
     return None
 
 
-def load_molmoact_data(data_dir: str) -> List[Dict[str, Any]]:
+def _load_camera_paths_from_dir(ep_dir: Path) -> Dict[str, List[Path]]:
+    """Collect sorted image paths from each camera subdir (left_rgb/, right_rgb/, front_rgb/).
+
+    Returns a dict keyed by stripped camera name ("left", "right", "front"), matching
+    the keys consumed by ``infer_common_cameras`` and ``create_lerobot_dataset_v30``.
     """
-    Load MolmoAct episodes, but store image PATHS instead of pixel data
-    to save memory during the initial load.
+    camera_paths: Dict[str, List[Path]] = {}
+    for camera_dir in [ep_dir / "left_rgb", ep_dir / "right_rgb", ep_dir / "front_rgb"]:
+        if not camera_dir.exists():
+            continue
+        cam_name = camera_dir.name.replace("_rgb", "")
+        camera_paths[cam_name] = _sorted_image_files(camera_dir)
+    return camera_paths
+
+
+def _load_episode_from_json(ep_dir: Path, json_path: Path) -> Dict[str, Any] | None:
+    """Load one episode whose per-frame metadata lives in a JSON list (DataSaver layout)."""
+    if not json_path.exists():
+        return None
+    with open(json_path, "r") as f:
+        episode_data = json.load(f)
+    if not episode_data:
+        return None
+
+    task_description = _extract_task_text(episode_data[0])
+
+    left_joint = np.array(
+        [json.loads(fd["left_joint"]) for fd in episode_data], dtype=np.float32
+    )
+    right_joint = np.array(
+        [json.loads(fd["right_joint"]) for fd in episode_data], dtype=np.float32
+    )
+    has_next_joint = all(
+        ("next_left_joint" in fd and "next_right_joint" in fd) for fd in episode_data
+    )
+    next_qpos = None
+    if has_next_joint:
+        next_left = np.array(
+            [json.loads(fd["next_left_joint"]) for fd in episode_data], dtype=np.float32
+        )
+        next_right = np.array(
+            [json.loads(fd["next_right_joint"]) for fd in episode_data], dtype=np.float32
+        )
+        next_qpos = np.concatenate([next_left, next_right], axis=1)  # (T, 14)
+    qpos = np.concatenate([left_joint, right_joint], axis=1)  # (T, 14)
+
+    return {
+        "task_description": task_description,
+        "qpos": qpos,
+        "next_qpos": next_qpos,
+        "episode_length": len(qpos),
+        "camera_paths": _load_camera_paths_from_dir(ep_dir),
+    }
+
+
+def _load_episode_from_h5(ep_dir: Path, h5_path: Path) -> Dict[str, Any] | None:
+    """Load one episode whose per-frame metadata lives in ``episode.h5`` (eval layout)."""
+    if not h5_path.exists():
+        return None
+    import h5py  # late import — keeps the JSON-only CLI path free of the h5py dep
+
+    with h5py.File(h5_path, "r") as f:
+        raw_instr = f.attrs.get("language_instruction", "")
+        if isinstance(raw_instr, (bytes, np.bytes_)):
+            instruction = raw_instr.decode()
+        else:
+            instruction = str(raw_instr)
+        qpos = np.asarray(f["state"][:], dtype=np.float32)
+        next_qpos = (
+            np.asarray(f["next_state"][:], dtype=np.float32) if "next_state" in f else None
+        )
+
+    return {
+        "task_description": instruction if instruction else None,
+        "qpos": qpos,
+        "next_qpos": next_qpos,
+        "episode_length": len(qpos),
+        "camera_paths": _load_camera_paths_from_dir(ep_dir),
+    }
+
+
+def load_molmoact_data(data_dir: str) -> List[Dict[str, Any]]:
+    """Load all numbered episode subdirs (``NNNNNN/``) from ``data_dir``.
+
+    Each ``NNNNNN/`` is expected to contain ``NNNNNN.json`` plus the per-camera image dirs.
+    Image data is stored as path lists, not pixels, to keep memory near zero.
     """
     episodes: List[Dict[str, Any]] = []
     data_path = Path(data_dir)
-
     episode_dirs = sorted(
         [d for d in data_path.iterdir() if d.is_dir() and d.name.isdigit()]
     )
     print(f"Found {len(episode_dirs)} episodes under {data_dir}")
 
     for ep_dir in episode_dirs:
-        episode_id = ep_dir.name
-        json_path = ep_dir / f"{episode_id}.json"
-
-        if not json_path.exists():
-            continue
-
-        with open(json_path, "r") as f:
-            episode_data = json.load(f)
-
-        if not episode_data:
-            continue
-
-        first_frame = episode_data[0]
-        task_description = _extract_task_text(first_frame)
-
-        # Joint positions and Actions
-        left_joint = np.array([json.loads(f["left_joint"]) for f in episode_data], dtype=np.float32)
-        right_joint = np.array([json.loads(f["right_joint"]) for f in episode_data], dtype=np.float32)
-        has_next_joint = all(("next_left_joint" in f and "next_right_joint" in f) for f in episode_data)
-        next_qpos = None
-        if has_next_joint:
-            next_left_joint = np.array([json.loads(f["next_left_joint"]) for f in episode_data], dtype=np.float32)
-            next_right_joint = np.array([json.loads(f["next_right_joint"]) for f in episode_data], dtype=np.float32)
-            next_qpos = np.concatenate([next_left_joint, next_right_joint], axis=1)  # (T, 14)
-
-        qpos = np.concatenate([left_joint, right_joint], axis=1)   # (T, 14)
-        episode_info: Dict[str, Any] = {
-            "task_description": task_description,
-            "qpos": qpos,
-            "next_qpos": next_qpos,
-            "episode_length": len(qpos),
-            "camera_paths": {}, # Changed from "images": [] to a path map
-        }
-
-        for camera_dir in [ep_dir / "left_rgb", ep_dir / "right_rgb", ep_dir / "front_rgb"]:
-            if not camera_dir.exists():
-                continue
-
-            cam_name = camera_dir.name.replace("_rgb", "")
-            image_files = _sorted_image_files(camera_dir)
-            # Store only the paths to keep RAM usage near zero here
-            episode_info["camera_paths"][cam_name] = image_files
-
-        episodes.append(episode_info)
+        json_path = ep_dir / f"{ep_dir.name}.json"
+        ep = _load_episode_from_json(ep_dir, json_path)
+        if ep is not None:
+            episodes.append(ep)
 
     print(f"Metadata loaded for {len(episodes)} episodes.")
+    return episodes
+
+
+def load_droid_layout_data(
+    base_dir: str | Path | None = None,
+    include_eval: bool = False,
+    explicit_paths: List[Path] | None = None,
+) -> List[Dict[str, Any]]:
+    """Load DROID-style episodes written by the eval system.
+
+    Expected on-disk layout::
+
+        base_dir/success/{date}/{ts}/   episode.h5 + left_rgb/ + right_rgb/ + front_rgb/
+        base_dir/failure/{date}/{ts}/
+        base_dir/eval/{ts}/              (only walked when include_eval=True)
+
+    ``explicit_paths`` overrides the directory walk — useful when the caller
+    already tracks the exact rollout dirs from this session.
+    """
+    episode_dirs: List[Path] = []
+    if explicit_paths is not None:
+        episode_dirs = [Path(p) for p in explicit_paths]
+    else:
+        if base_dir is None:
+            raise ValueError("Must provide base_dir or explicit_paths.")
+        base = Path(base_dir)
+        labels = ["success", "failure"] + (["eval"] if include_eval else [])
+        for label in labels:
+            label_dir = base / label
+            if not label_dir.exists():
+                continue
+            if label == "eval":
+                episode_dirs.extend(d for d in label_dir.iterdir() if d.is_dir())
+            else:
+                for date_dir in label_dir.iterdir():
+                    if date_dir.is_dir():
+                        episode_dirs.extend(d for d in date_dir.iterdir() if d.is_dir())
+
+    episode_dirs.sort()
+    print(f"Found {len(episode_dirs)} DROID-layout rollouts.")
+
+    episodes: List[Dict[str, Any]] = []
+    for ep_dir in episode_dirs:
+        ep = _load_episode_from_h5(ep_dir, ep_dir / "episode.h5")
+        if ep is not None:
+            episodes.append(ep)
+    print(f"Loaded {len(episodes)} DROID-layout episodes.")
     return episodes
 
 
@@ -467,7 +555,7 @@ def load_defaults_from_yaml(config_path: str) -> Dict[str, Any]:
     base_dir = storage.get("base_dir")
     task_directory = storage.get("task_directory")
     if base_dir and task_directory:
-        base_dir_path = Path(base_dir).expanduser()
+        base_dir_path = Path(base_dir).expanduser() / "data"
         defaults["data_dir"] = str(base_dir_path / str(task_directory))
         defaults["output_dir"] = str(base_dir_path / f"{task_directory}_lerobot_v30")
 

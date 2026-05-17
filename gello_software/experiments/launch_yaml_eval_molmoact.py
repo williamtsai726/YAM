@@ -1,49 +1,86 @@
-import atexit
-import signal
-from dataclasses import dataclass
-import time
-from typing import Any, Optional
+"""MolmoAct eval launcher.
 
-from PIL import Image
+Runs N rollouts, prompting for an instruction each time. Saves all three
+cameras frame-by-frame (PNG) plus the joint trajectory (``episode.h5``) per
+rollout, classifies rollouts via cv2 keypress (y/n/q) or a post-timeout
+stdin prompt, and converts the session's labeled rollouts to a LeRobot v3.0
+dataset on the way out.
+
+CLI::
+
+    python -m experiments.launch_yaml_eval_molmoact \
+        --left_config_path configs/yam_left.yaml \
+        --right_config_path configs/yam_right.yaml \
+        -n 10
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Optional, Tuple
+
+import numpy as np
 import torch
 import tyro
 from omegaconf import OmegaConf
 
-from gello.utils.launch_utils import instantiate_from_dict, move_to_start_position
-import numpy as np
-
 from gello.cameras.realsense_camera import RealSenseCamera, get_device_ids
 from gello.env import RobotEnv
+from gello.utils.eval_utils import (
+    EvalRolloutSaver,
+    LiveCameraView,
+    RolloutOutcome,
+    convert_session_to_lerobot,
+    move_rollout,
+    prompt_instruction,
+    resolve_label,
+)
+from gello.utils.launch_utils import instantiate_from_dict, move_to_start_position
 from gello.utils.logging_utils import log_collect_demos
 from molmoact import MolmoAct
-import logging
-import os
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 DEVICE = os.environ.get("LEROBOT_TEST_DEVICE", "cuda") if torch.cuda.is_available() else "cpu"
 
-# Global variables for cleanup
-cleanup_in_progress = False
 
-_env = None
-_bimanual = False
-_left_cfg = None
-_right_cfg = None
+# ---------------------------------------------------------------------------
+# atexit parking
+# ---------------------------------------------------------------------------
+
+_env: Optional[RobotEnv] = None
+_bimanual: bool = False
+_left_cfg: Optional[Dict[str, Any]] = None
+_right_cfg: Optional[Dict[str, Any]] = None
+_cleanup_done: bool = False
 
 
-def cleanup():
-    """Clean up resources before exit."""
-    global cleanup_in_progress
-    if cleanup_in_progress:
+def _park_robot() -> None:
+    """atexit hook: park arm back at start_joints regardless of exit path."""
+    global _cleanup_done
+    if _cleanup_done or _env is None:
         return
-    cleanup_in_progress = True
+    _cleanup_done = True
+    print("Parking robot at start position...")
+    try:
+        if _bimanual:
+            move_to_start_position(_env, True, _left_cfg, _right_cfg)
+        else:
+            move_to_start_position(_env, False, _left_cfg)
+    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+        logger.warning("Parking failed: %s", exc)
 
-    print("Cleaning up resources...")
-    if _bimanual:
-        move_to_start_position(_env, _bimanual, _left_cfg, _right_cfg)
-    else:
-        move_to_start_position(_env, _bimanual, _left_cfg)
-    print("Cleanup completed.")
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -54,38 +91,27 @@ class Args:
     right_config_path: Optional[str] = None
     """Path to the right arm configuration YAML file (for bimanual operation)."""
 
-    # use_save_interface: bool = False
-    # """Enable saving data with keyboard interface."""
+    num_rollouts: Annotated[int, tyro.conf.arg(aliases=("-n",))] = 1
+    """How many rollouts to run in this session."""
 
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully."""
-    cleanup()
-    import os
-
-    os._exit(0)
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
 
 
-def main():
-    # Register cleanup handlers
-    # If terminated without cleanup, can leave ZMQ sockets bound causing "address in use" errors or resource leaks
-
-    atexit.register(cleanup)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    args = tyro.cli(Args)
-
-    # left, right front camera (the device id order is based on the plugged in order on the adapter)
+def _build_env(
+    args: Args,
+) -> Tuple[RobotEnv, Dict[str, Any], Optional[Dict[str, Any]], bool]:
+    """Build cameras + robot(s) + RobotEnv from the launch configs."""
     ids = get_device_ids()
-    print(f"Found {len(ids)} camera devices")
-    print(ids)
+    print(f"Found {len(ids)} camera devices: {ids}")
 
+    left_cfg = OmegaConf.to_container(OmegaConf.load(args.left_config_path), resolve=True)
     bimanual = args.right_config_path is not None
-
-    # Load configs
-    left_cfg = OmegaConf.to_container(
-        OmegaConf.load(args.left_config_path), resolve=True
+    right_cfg = (
+        OmegaConf.to_container(OmegaConf.load(args.right_config_path), resolve=True)
+        if bimanual else None
     )
 
     camera_cfg = left_cfg["sensors"]["cameras"]
@@ -95,113 +121,271 @@ def main():
         "right_camera": RealSenseCamera(camera_cfg["right_camera"]["device_id"]),
     }
 
-    if bimanual:
-        right_cfg = OmegaConf.to_container(
-            OmegaConf.load(args.right_config_path), resolve=True
-        )
-
-    # Create robot(s)
     left_robot_cfg = left_cfg["robot"]
     if isinstance(left_robot_cfg.get("config"), str):
         left_robot_cfg["config"] = OmegaConf.to_container(
             OmegaConf.load(left_robot_cfg["config"]), resolve=True
         )
-
     left_robot = instantiate_from_dict(left_robot_cfg)
 
     if bimanual:
         from gello.robots.robot import BimanualRobot
-
         right_robot_cfg = right_cfg["robot"]
         if isinstance(right_robot_cfg.get("config"), str):
             right_robot_cfg["config"] = OmegaConf.to_container(
                 OmegaConf.load(right_robot_cfg["config"]), resolve=True
             )
-
         right_robot = instantiate_from_dict(right_robot_cfg)
         robot = BimanualRobot(left_robot, right_robot)
-
-        # For bimanual, use the left config for general settings (hz, etc.)
-        cfg = left_cfg
     else:
         robot = left_robot
-        cfg = left_cfg
 
-    from gello.env import RobotEnv
-    env = RobotEnv(robot, control_rate_hz=cfg.get("hz", 30), camera_dict=cameras)
+    env = RobotEnv(robot, control_rate_hz=left_cfg.get("hz", 30), camera_dict=cameras)
+    return env, left_cfg, right_cfg, bimanual
 
-    # Store global variables for cleanup
+
+# ---------------------------------------------------------------------------
+# Inner loop
+# ---------------------------------------------------------------------------
+
+
+def dynamic_smoothing(env: RobotEnv, target_joints: np.ndarray) -> Dict[str, Any]:
+    """Apply ``target_joints`` via sub-tick linear interpolation. Returns final obs."""
+    curr_joints = env.get_obs()["joint_positions"]
+    max_delta = float(np.abs(curr_joints - target_joints).max())
+    steps = min(int(max_delta / 0.01), 100)
+    if steps <= 1:
+        return env.step(target_joints)
+    obs: Optional[Dict[str, Any]] = None
+    for jnt in np.linspace(curr_joints, target_joints, steps):
+        obs = env.step(jnt)
+        time.sleep(0.001)
+    return obs  # type: ignore[return-value]  # at least one iteration executed
+
+
+def run_one_rollout(
+    env: RobotEnv,
+    policy: MolmoAct,
+    saver: EvalRolloutSaver,
+    instruction: str,
+    rollout_idx: int,
+    num_rollouts: int,
+    max_steps: int,
+    live_view: LiveCameraView,
+) -> RolloutOutcome:
+    """Execute one rollout and buffer per-step observations into ``saver``.
+
+    End conditions:
+
+    * ``cv2`` keypress ``y`` -> success (labeled)
+    * ``cv2`` keypress ``n`` -> failure (labeled)
+    * ``cv2`` keypress ``q`` -> quit (no label; rollout stays in ``eval/``)
+    * step >= ``max_steps`` -> timeout (stdin prompt afterwards)
+
+    Does NOT flush the saver — the caller does that so the Ctrl-C path can
+    also flush the partial buffer.
+    """
+    chunk_size = max(1, int(policy.get_action_horizon()))
+    action_chunk: Optional[List[Any]] = None
+
+    for step in range(max_steps):
+        # Refresh the policy's action chunk every ``chunk_size`` outer steps.
+        # The obs used by the policy is sampled exactly once per chunk; per-step
+        # obs (used for save / live view) is sampled fresh below.
+        if action_chunk is None or (step % chunk_size) == 0:
+            obs_for_policy = env.get_obs()
+            input_dict = policy.prepare_input(obs_for_policy, instruction)
+            t0 = time.time()
+            action_chunk = policy.inference(input_dict)["actions"]
+            log_collect_demos(
+                f"Policy inference {time.time() - t0:.3f}s "
+                f"({len(action_chunk)} actions)",
+                "data_info",
+            )
+
+        action = np.asarray(action_chunk[step % chunk_size])
+        obs_pre = env.get_obs()
+        obs_post = dynamic_smoothing(env, action) or obs_pre
+
+        saver.add_step(obs_pre=obs_pre, obs_post=obs_post)
+
+        key = live_view.update(
+            obs=obs_pre,
+            rollout_idx=rollout_idx,
+            num_rollouts=num_rollouts,
+            step=step + 1,
+            max_steps=max_steps,
+            instruction=instruction,
+        )
+        if key == "y":
+            return RolloutOutcome(end_reason="success", last_step=step + 1)
+        if key == "n":
+            return RolloutOutcome(end_reason="failure", last_step=step + 1)
+        if key == "q":
+            return RolloutOutcome(end_reason="quit", last_step=step + 1)
+
+    return RolloutOutcome(end_reason="timeout", last_step=max_steps)
+
+
+# ---------------------------------------------------------------------------
+# Session driver
+# ---------------------------------------------------------------------------
+
+
+def run_session(
+    env: RobotEnv,
+    policy: MolmoAct,
+    left_cfg: Dict[str, Any],
+    num_rollouts: int,
+) -> None:
+    """Drive ``num_rollouts`` rollouts; convert the labeled set to LeRobot at the end.
+
+    Catches ``KeyboardInterrupt`` so an in-progress rollout still gets flushed
+    (as incomplete, with ``err.md``) and any rollouts already labeled in this
+    session are still converted.
+    """
+    storage = left_cfg["storage"]
+    base_save_dir = Path(storage["base_dir"]) / "data" / storage["task_directory"]
+    max_steps = int(left_cfg.get("max_steps", 1000))
+    last_prompt = storage.get("language_instruction") or ""
+
+    eval_cfg = left_cfg.get("eval") or {}
+    live_view = LiveCameraView(enabled=bool(eval_cfg.get("live_view_enabled", True)))
+
+    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    labeled_rollouts: List[Path] = []
+    saver: Optional[EvalRolloutSaver] = None
+    outcome: Optional[RolloutOutcome] = None
+
+    try:
+        for rollout_idx in range(num_rollouts):
+            instruction = prompt_instruction(rollout_idx, num_rollouts, last_prompt)
+            last_prompt = instruction
+
+            rollout_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rollout_dir = base_save_dir / "eval" / rollout_timestamp
+            saver = EvalRolloutSaver(
+                rollout_dir=rollout_dir,
+                instruction=instruction,
+                max_workers=int(storage.get("saver_max_workers", 2)),
+                png_compress_level=int(storage.get("png_compress_level", 1)),
+            )
+
+            print(f"\n--- Rollout {rollout_idx + 1}/{num_rollouts} ---")
+            print(f"  instruction: {instruction}")
+            print(f"  rollout_dir: {rollout_dir}")
+
+            outcome = run_one_rollout(
+                env=env,
+                policy=policy,
+                saver=saver,
+                instruction=instruction,
+                rollout_idx=rollout_idx,
+                num_rollouts=num_rollouts,
+                max_steps=max_steps,
+                live_view=live_view,
+            )
+
+            saver.flush()
+            label = resolve_label(outcome)
+            if label is not None:
+                new_path = move_rollout(rollout_dir, label, base_save_dir)
+                labeled_rollouts.append(new_path)
+                print(f"  -> labeled '{label}': {new_path}")
+            else:
+                print(f"  -> kept in eval/: {rollout_dir}")
+
+            # Clear references so the KeyboardInterrupt path doesn't re-flush.
+            saver = None
+            outcome = None
+    except KeyboardInterrupt:
+        print("\n[interrupt] Ctrl-C received — saving incomplete rollout, then converting...")
+        if saver is not None:
+            try:
+                saver.flush()
+                saver.write_err(
+                    reason="KeyboardInterrupt",
+                    step=outcome.last_step if outcome else saver.num_steps,
+                )
+                print(f"  -> incomplete rollout saved: {saver.rollout_dir}")
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+                logger.exception("Failed to flush incomplete rollout: %s", exc)
+    finally:
+        live_view.close()
+        _convert_if_any(labeled_rollouts, base_save_dir, session_timestamp, left_cfg)
+
+
+def _convert_if_any(
+    labeled_rollouts: List[Path],
+    base_save_dir: Path,
+    session_timestamp: str,
+    left_cfg: Dict[str, Any],
+) -> None:
+    """Best-effort LeRobot conversion of this session's labeled rollouts."""
+    if not labeled_rollouts:
+        print("\n[session] No labeled rollouts this session — nothing to convert.")
+        return
+
+    lerobot_cfg = left_cfg.get("lerobot", {}) or {}
+    output_dir = base_save_dir / "eval_lerobot_v30" / session_timestamp
+    print(
+        f"\n[session] Converting {len(labeled_rollouts)} labeled rollouts "
+        f"to LeRobot v3.0 at {output_dir} ..."
+    )
+    try:
+        convert_session_to_lerobot(
+            session_rollout_dirs=labeled_rollouts,
+            output_dir=output_dir,
+            fps=int(lerobot_cfg.get("fps", left_cfg.get("hz", 30))),
+            robot_type=str(lerobot_cfg.get("robot_type", "molmoact_dual_arm")),
+            repo_id=str(lerobot_cfg.get("hf_repo_id", "local/eval_session")),
+            action_mode=str(lerobot_cfg.get("action_mode", "next_joint_fields")),
+            vcodec=str(lerobot_cfg.get("vcodec", "libsvtav1")),
+            sanitize_online_viz_meta=bool(lerobot_cfg.get("sanitize_online_viz_meta", True)),
+            image_writer_processes=int(lerobot_cfg.get("image_writer_processes", 0)),
+            image_writer_threads=int(lerobot_cfg.get("image_writer_threads", 0)),
+            parallel_encoding=bool(lerobot_cfg.get("parallel_encoding", True)),
+        )
+    except Exception as exc:  # noqa: BLE001 — keep raw rollouts even if conversion fails
+        logger.exception("LeRobot conversion failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    atexit.register(_park_robot)
+
+    args = tyro.cli(Args)
+    if args.num_rollouts < 1:
+        raise SystemExit("--num_rollouts must be >= 1")
+
+    env, left_cfg, right_cfg, bimanual = _build_env(args)
+
     global _env, _bimanual, _left_cfg, _right_cfg
     _env = env
     _bimanual = bimanual
     _left_cfg = left_cfg
-    _right_cfg = right_cfg if bimanual else None
-
-    # Move robot to start_joints position if specified in config
-    from gello.utils.launch_utils import move_to_start_position
+    _right_cfg = right_cfg
 
     if bimanual:
-        move_to_start_position(env, bimanual, left_cfg, right_cfg)
+        move_to_start_position(env, True, left_cfg, right_cfg)
     else:
-        move_to_start_position(env, bimanual, left_cfg)
+        move_to_start_position(env, False, left_cfg)
 
+    print(f"Launching robot: {env.robot().__class__.__name__}")
+    print(f"Control loop: {left_cfg.get('hz', 30)} Hz")
     print(
-        f"Launching robot: {robot.__class__.__name__}"
+        f"Rollouts this session: {args.num_rollouts}, "
+        f"max_steps: {left_cfg.get('max_steps', 1000)}"
     )
-    print(f"Control loop: {cfg.get('hz', 30)} Hz")
 
-    molmoact = MolmoAct()
-    run_control_loop_eval(env, policy=molmoact, instruction=left_cfg["storage"]["language_instruction"])
+    server = (left_cfg.get("eval") or {}).get("molmoact_server")
+    policy = MolmoAct(server=server)
+    run_session(env=env, policy=policy, left_cfg=left_cfg, num_rollouts=args.num_rollouts)
 
-
-def run_control_loop_eval(
-    env: RobotEnv,
-    policy: MolmoAct = None,
-    instruction: str = None,
-) -> None:
-    """Run the main control loop.
-
-    Args:
-        env: Robot environment
-        agent: Agent for control
-        save_interface: Optional save interface for data collection
-        print_timing: Whether to print timing information
-        use_colors: Whether to use colored terminal output
-    """
-    start_time = time.time()
-    obs = env.get_obs()
-    logger.info("Starting policy inference...")
-
-    while True:
-        log_collect_demos("Running policy inference...", "info")
-        input_dict = policy.prepare_input(obs, instruction)
-        start_time = time.time()
-        actions = policy.inference(input_dict)["actions"]
-        inference_time = time.time() - start_time
-        log_collect_demos(f"Policy inference completed in {inference_time:.3f}s", "success")
-        log_collect_demos(f"Generated {len(actions)} action(s)", "data_info")
-        for i in range(len(actions)):
-            obs = dynamic_smoothing(env, np.array(actions[i]))
-
-def dynamic_smoothing(
-                env,
-                target_joints: np.ndarray,
-            ):
-    curr_joints = env.get_obs()["joint_positions"]
-
-    max_delta = (np.abs(curr_joints - target_joints)).max()
-    steps = min(int(max_delta / 0.01), 100)
-    if steps <= 1:
-        obs = env.step(target_joints)
-        return obs
-    print(f"Moving to start position with {steps} steps")
-
-    # print(f"Moving robot to target joints position: {target_joints}")
-    obs = None
-    for jnt in np.linspace(curr_joints, target_joints, steps):
-        obs = env.step(jnt)
-        time.sleep(0.001)
-    return obs
 
 if __name__ == "__main__":
     main()

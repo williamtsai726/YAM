@@ -1,47 +1,63 @@
 # Bimanual YAM
 A robotics framework for Teleoperation, Data Collection, and model evaluation on Bimanual YAM.
 
+## Repository Layout
+| Path | What it is |
+|---|---|
+| `i2rt/` | Low-level motor + CAN driver code, motor config tools, CAN reset script. |
+| `gello_software/` | Main runtime: configs, teleop / data collection / eval launchers. |
+| `lerobot/` | Local LeRobot checkout used for dataset conversion. |
+| `oculus_reader/` | Optional Oculus VR teleop input. |
+| `molmoact_to_lerobot_v30.py` | Top-level converter: raw collected JSON → LeRobot v3.0, with optional HF upload. |
+
 ## Quick Start
 
 ### 1. Environment Setup
 
-First, create conda environment.
+Create a conda environment (this repo is developed against Python 3.11):
 
 ```bash
-# Replace 'yam' with your preferred environment name
-conda create -n yam python=3.11 -y
-conda activate yam
+conda create -n ai2_yam python=3.11 -y
+conda activate ai2_yam
 ```
 
-Then, go to each subdirectory ```gello_software, i2rt, lerobot``` and install their dependencies. We recommend starting from ```i2rt``` to setup your YAM, then go to ```gello_software``` to setup the gello for YAM, and finally go to ```lerobot```.
+Then install each subproject's dependencies. Recommended order: `i2rt` first (sets up YAM motors), then `gello_software` (sets up the gello + main runtime), then `lerobot` (dataset conversion). Each subdirectory has its own README and requirements.
 
+> Throughout the rest of this guide, the conda env is assumed to be active. The CAN channel names used below — `can_leader_l` (left arm) and `can_follower_r` (right arm) — match this workstation's setup. Confirm yours with `ip link show | grep can` and adjust if different; the channel name in `gello_software/configs/yam_left.yaml` / `yam_right.yaml` must agree with what `ip link show` reports.
 
-### 2. Motor Configuration (Recommended)
-For long time bimanual teleop, data collection, or evaluation, the default timeout is too short and often causes abrupt collapse. To prevent that, we turn off the motor timeout for both arms.
+### 2. Per-Boot Startup Sequence
+
+Run these every time the YAM is power-cycled or replugged:
+
+```bash
+# Reset all CAN interfaces (brings them up at 1 Mbit/s)
+bash i2rt/scripts/reset_all_can.sh
+
+# Disable the motor timeout on both arms (default is too short for long sessions
+# and causes abrupt collapse during teleop / data collection / eval)
+python i2rt/i2rt/motor_config_tool/set_timeout.py --channel can_leader_l
+python i2rt/i2rt/motor_config_tool/set_timeout.py --channel can_follower_r
 ```
-python i2rt/i2rt/motor_config_tool/set_timeout.py --channel can_left &&
-python i2rt/i2rt/motor_config_tool/set_timeout.py --channel can_right
-```
 
+### 3. Reset Gripper Zero (only for the Linear gripper at max grip)
+The gripper does not auto-recalibrate on power-up — it treats its current position as zero (closed), which can lead to motor overheat. Close the gripper fully before powering on, then reset its zero position:
+
+```bash
+python i2rt/i2rt/motor_config_tool/set_zero.py --channel=can_leader_l --motor_id=7
+python i2rt/i2rt/motor_config_tool/set_zero.py --channel=can_follower_r --motor_id=7
+```
 
 ## Gello Configuration
-After setting up the robots, everything needed is located in ```gello_software```.
-```
+All teleop / data collection / eval entry points live under `gello_software/`:
+
+```bash
 cd gello_software
 ```
 
-Upon reconnecting the YAM to the PC, make sure to reset the CAN.
-```
-bash scripts/reset_all_can.sh
-```
-Configuration of the left arm is in ```configs/yam_left.yaml``` and configuration of the right arm is in ```configs/yam_right.yaml```. (The existing files are samples. You should generate your own configs files by going through the instruction in ```gello_software```. Note that the generated configs file would only contain the robot field. You would need to copy over the other field yourself.)
+- Left-arm config: `configs/yam_left.yaml`
+- Right-arm config: `configs/yam_right.yaml`
 
-## Reset gripper (only if using the Linear gripper with maximum grip)
-The gripper fails to auto-recaliberate when you tried to power it back on. Without manual recalibration, it will use the current state as the 0 position (close), which would lead to motor overheat error. Therefore, close the gripper after/before you power it on and run the following command to reset the 0 position of the gripper.
-```
-python ../i2rt/i2rt/motor_config_tool/set_zero.py --channel=can_left --motor_id=7 &&
-python ../i2rt/i2rt/motor_config_tool/set_zero.py --channel=can_right --motor_id=7
-```
+The shipped files are working samples for this workstation. To generate your own from scratch, follow the instructions in `gello_software/README.md`. Note that the auto-generated configs only contain the `robot` block — you must copy the rest (`agent`, `sensors`, `collection`, `storage`, `lerobot`, `policy`, etc.) over manually.
 
 ## Cameras
 The cameras we used are Intel Realsense cameras. If you are using the same cameras, simply change the ```device_id``` in the configuration file ```configs/yam_left.yaml``` to match the ones you are using.
@@ -224,14 +240,48 @@ camera_mapping = {"left_camera_rgb": 'left', "right_camera_rgb": 'right', "front
 ## Model Evaluation for MolmoAct2
 Current evaluation supports remote inference only. The MolmoAct2 model should be hosted in a remote server.
 
-Update the server url in ```experiments/molmoact.py``` (line 13).
+Update the server url in ```experiments/molmoact.py``` (line 13). The default task instruction lives in ```storage.language_instruction``` in ```configs/yam_left.yaml``` and is offered as the first-rollout default; you can override it interactively per rollout.
 
-Update the task instruction ```storage.language_instruction``` in ```configs/yam_left.yaml```.
-
-After configuring policy, run:
+Run N rollouts in a single session:
 ```bash
-python experiments/launch_yaml_eval_molmoact.py --left_config_path=configs/yam_left.yaml --right_config_path=configs/yam_right.yaml
+python experiments/launch_yaml_eval_molmoact.py \
+    --left_config_path=configs/yam_left.yaml \
+    --right_config_path=configs/yam_right.yaml \
+    -n 10
 ```
+
+### Per-rollout flow
+1. A stdin prompt asks for the task instruction for this rollout. Press Enter to reuse the previous rollout's instruction; the first rollout defaults to ```storage.language_instruction```.
+2. A live cv2 window opens showing the three policy-input frames (left | front | right) side-by-side with a header showing the current rollout/step/instruction.
+3. The rollout ends on one of:
+   - Keypress ```y``` in the cv2 window → label **success** (moved to ```{base_dir}/{task_directory}/success/{YYYY-MM-DD}/{timestamp}/```).
+   - Keypress ```n``` → label **failure** (moved to ```failure/{YYYY-MM-DD}/{timestamp}/```).
+   - Keypress ```q``` → quit rollout, no label (stays in ```eval/{timestamp}/```).
+   - ```max_steps``` reached → terminal prompts ```Label rollout (y / n / Enter)``` for a DROID-style label; Enter keeps it in ```eval/```.
+
+### Saved per rollout
+Each rollout directory contains:
+- ```left_rgb/```, ```front_rgb/```, ```right_rgb/``` — one PNG per control step.
+- ```episode.h5``` — joint trajectory (```state```, ```next_state```) + language instruction attribute.
+- ```err.md``` — written only if the rollout was incomplete (e.g. Ctrl-C).
+
+Directory layout under ```{base_dir}/{task_directory}/```:
+```
+eval/{timestamp}/                  # unlabeled or incomplete rollouts
+success/{YYYY-MM-DD}/{timestamp}/
+failure/{YYYY-MM-DD}/{timestamp}/
+eval_lerobot_v30/{session_ts}/     # LeRobot v3.0 dataset for this session
+```
+
+### End of session
+After the N rollouts finish — or on ```ctrl+c```, in which case the partial rollout is saved to ```eval/``` with an ```err.md``` marker — labeled rollouts (success + failure) from this session are batch-converted into a single LeRobot v3.0 dataset under ```eval_lerobot_v30/{session_ts}/```. Conversion reuses the existing ```lerobot:``` config block (```fps```, ```robot_type```, ```action_mode```, ```vcodec```, ```hf_repo_id```, etc.). Raw rollouts are kept on disk regardless of conversion outcome, so you can re-run ```python molmoact_to_lerobot_v30.py``` later if needed.
+
+### Optional eval config
+```yaml
+eval:
+  live_view_enabled: true  # show the 3-pane cv2 window during rollouts (default true)
+```
+```max_steps``` (default 1000) is read from the top-level config field; the ```lerobot:``` block is reused as-is.
 
 ## Other tools for testing
 Within the ```gello_software/experiments```directory, we have:

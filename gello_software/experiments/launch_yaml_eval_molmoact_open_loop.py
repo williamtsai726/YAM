@@ -146,7 +146,7 @@ def main():
     data_replayer = DataReplayer(save_format=left_cfg['storage']['save_format'], old_format=left_cfg['storage']['old_format'])
     data_replayer.load_episode(left_cfg['storage']['base_dir'] + '/' + task, episode_number)
     
-    molmoact = MolmoAct()
+    molmoact = MolmoAct(server=(left_cfg.get("eval") or {}).get("molmoact_server"))
     if bimanual:
         run_control_loop_eval_open_loop(env, policy=molmoact, data_replayer=data_replayer, instruction=left_cfg["storage"]["language_instruction"])
     else:

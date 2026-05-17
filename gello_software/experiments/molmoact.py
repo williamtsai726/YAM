@@ -1,5 +1,5 @@
 from policy_base import PolicyBase
-from typing import List
+from typing import List, Optional
 import numpy as np
 import time
 import requests
@@ -7,10 +7,29 @@ import json_numpy
 json_numpy.patch()
 from gello.utils.logging_utils import get_molmoact_logger
 
+DEFAULT_SERVER = "https://unachievable-tawana-subtransparent.ngrok-free.dev"
+
+
+def _normalize_server_url(server: Optional[str]) -> str:
+    """Accept ngrok URLs (``https://...``), bare IPs (``10.0.0.5``), or
+    ``host:port`` strings, and return a full ``http(s)://host[:port]/act`` URL.
+
+    - If empty/None, falls back to ``DEFAULT_SERVER``.
+    - If no scheme is provided, ``http://`` is prepended (suitable for LAN IPs).
+    - Trailing ``/act`` is appended unless the input already ends in ``/act``.
+    """
+    s = (server or DEFAULT_SERVER).strip().rstrip("/")
+    if "://" not in s:
+        s = "http://" + s
+    if not s.endswith("/act"):
+        s = s + "/act"
+    return s
+
+
 class MolmoAct(PolicyBase):
-    def __init__(self):
+    def __init__(self, server: Optional[str] = None):
         self.logger = get_molmoact_logger()
-        self.url = "https://d29e-71-41-244-70.ngrok-free.app/act"
+        self.url = _normalize_server_url(server)
         self.multi_views = True
         self.action_horizon = 25
 
@@ -143,7 +162,8 @@ class MolmoAct(PolicyBase):
                     "right_cam": right_img_np,
                     "timestamp": time.time(), # add timestamp for debugging
                     "instruction": instruction,
-                    "state": state
+                    "state": state,
+                    "normalization_tag": "yam_dual_molmoact2"
                 }
 
             self.logger.info("Preparing HTTP request")

@@ -2,16 +2,16 @@
 sensors:
   cameras:
     left_camera:
-      device_id: "218722270092"
+      device_id: "352122273468"
     front_camera:
-      device_id: "336222076815"
+      device_id: "037522250599"
     right_camera:
-      device_id: "218622276072"
+      device_id: "352122272526"
 
 # robot info
 robot:
   _target_: gello.robots.yam.YAMRobot
-  channel: can_left
+  channel: can_leader_l
 agent:
   _target_: gello.agents.gello_agent.GelloAgent
   port: /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAO9WPU-if00-port0
@@ -36,10 +36,10 @@ collection:
 # Data storage configuration
 storage:
   episodes: 100
-  base_dir: "/media/sean/Samsung980"
-  task_directory: "put_on_the_cap"
-  language_instruction: "Sort the candy"
-  teleop_device: "gello" # ["oculus", "keyboard", "gello", "none"]
+  base_dir: "/home/kostas-lab/projects/YAM"
+  task_directory: "shirt"
+  language_instruction: 'Put the can into the basket'
+  teleop_device: "oculus" # ["oculus", "keyboard", "gello", "none"]
   save_format: "json" # ["json", "npy"]
   saver_max_workers: 2
   png_compress_level: 1
@@ -48,7 +48,7 @@ storage:
 # LeRobot conversion + upload pipeline
 lerobot:
   auto_convert: true
-  auto_upload: true
+  auto_upload: false
   hf_repo_id: "williamtsai726/put_on_the_cap_0329"
   delete_local_after_upload: true
   fps: 30
@@ -64,4 +64,16 @@ lerobot:
 # Policy configuration
 policy:
   type: "pi05"
-  checkpoint_path: "Jiafei1224/pi-snack"
+  repo_id: "williamtsai726/add_milk_to_the_coffee_0326"
+  # checkpoint_path: "Jiafei1224/pi-snack"
+  checkpoint_path: "lerobot/pi05_base"
+
+# Eval session configuration (used by launch_yaml_eval_molmoact.py)
+eval:
+  live_view_enabled: true        # show the 3-pane cv2 window during rollouts
+  # MolmoAct inference server. Accepts either:
+  #   - a full URL (e.g. "https://<ngrok-subdomain>.ngrok-free.dev")
+  #   - a bare host:port (e.g. "10.102.245.84:8202") -- http:// is assumed
+  # Trailing "/act" is appended automatically if missing.
+  molmoact_server: "10.102.245.84:8202"
+  # max_steps and lerobot.* are reused from the existing top-level blocks above.
