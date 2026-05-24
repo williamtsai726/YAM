@@ -280,13 +280,21 @@ class DMSingleMotorCanInterface(CanInterface):
         error_message = MotorErrorCode.get_error_message(error_int)
 
         motor_id_of_this_response = self.receive_mode.to_motor_id(message.arbitration_id)
+        # Temperatures reported in this same feedback frame; parse them up front
+        # so the over-temp/error log can show what the motor actually claims.
+        temp_mos_reported = data[6]
+        temp_rotor_reported = data[7]
         if error_hex != "0x1":
             logging.warning(
-                f"motor id: {motor_id_of_this_response}, error: {error_message} at {self.name} and channel {self.bus.channel_info}"
+                f"motor id: {motor_id_of_this_response}, error: {error_message} "
+                f"(reported temp_mos={temp_mos_reported}C, temp_rotor={temp_rotor_reported}C) "
+                f"at {self.name} and channel {self.bus.channel_info}"
             )
             if not ignore_error:
                 logging.error(
-                    f"motor id: {motor_id_of_this_response}, error: {error_message} at {self.name} and channel {self.bus.channel_info}"
+                    f"motor id: {motor_id_of_this_response}, error: {error_message} "
+                    f"(reported temp_mos={temp_mos_reported}C, temp_rotor={temp_rotor_reported}C) "
+                    f"at {self.name} and channel {self.bus.channel_info}"
                 )
                 raise RuntimeError(
                     f"Motor error detected: motor id: {motor_id_of_this_response}, error: {error_message}"

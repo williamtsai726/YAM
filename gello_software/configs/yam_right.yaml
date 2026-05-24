@@ -1,6 +1,6 @@
 robot:
   _target_: gello.robots.yam.YAMRobot
-  channel: can_right
+  channel: can_follower_r
 agent:
   _target_: gello.agents.gello_agent.GelloAgent
   port: /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAO9WCV-if00-port0
@@ -10,7 +10,7 @@ agent:
     joint_offsets: [3.14159, 3.14159, 3.14159, 3.14159, 3.14159, 3.14159]
     joint_signs: [1.0, -1.0, 1.0, -1.0, 1.0, 1.0]
     gripper_config: [14, 55.869140625, 108.369140625]
-  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 hz: 30
 max_steps: 1000
 

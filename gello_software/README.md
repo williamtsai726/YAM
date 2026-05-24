@@ -275,6 +275,33 @@ Process collected data:
 python gello/data_utils/demo_to_gdict.py --source-dir=<source_dir>
 ```
 
+### Camera Server (eval, optional)
+
+For MolmoAct eval, the 3 RealSense cameras can be hosted in a long-lived ZMQ server (`gello/cameras/camera_server.py`) so the policy client only pulls frames when it actually needs an obs. This keeps the pipelines warm across rollouts and decouples robot-control sub-step timing from camera I/O.
+
+**1. Start the server (leave running across sessions):**
+
+```bash
+sh scripts/start_camera_server.sh configs/yam_left.yaml
+```
+
+It binds REP on `tcp://127.0.0.1:5555` (on-demand obs) and PUB on `tcp://127.0.0.1:5556` (optional stream for the live viewer). Heartbeat logs every 10 s.
+
+**2. Enable the client in `configs/yam_left.yaml`:**
+
+```yaml
+eval:
+  camera_server:
+    enabled: true                       # off by default
+    endpoint: "tcp://127.0.0.1:5555"
+    request_timeout_ms: 500
+    max_frame_age_sec: 0.5
+```
+
+**3. Run the eval launcher as usual.** It will ping the server on startup and fail loudly if it isn't up.
+
+Data collection / replay / open-loop launchers are untouched and keep opening RealSense devices in-process.
+
 ### Bimanual Operation
 
 The recommended way to use bimanual mode is with `launch_yaml.py`. Pass a config file for the right arm to `--right-config-path`.

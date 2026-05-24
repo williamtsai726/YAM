@@ -1,0 +1,183 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ============================================================
+# Project-specific
+# ============================================================
+
+# Recorded videos / media outputs
+videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+
+logs/
+
+# Dataset / experiment artifacts
+# *.hdf5
+# *.h5
+# *.pkl
+# *.pickle
+# *.npy
+# *.npz
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+checkpoints/
+weights/
+
+# Logs / outputs
+data/
+logs/
+outputs/
+wandb/
+runs/
+tb_logs/
+tensorboard/
+
+# LeRobot / HuggingFace caches
+.cache/
+hf_cache/
+
+# Local configuration overrides
+*.local.yaml
+*.local.yml
+
+# SSH keys / credentials — never commit
+id_ed25519*
+id_rsa*
+*.pem
+*.key
+
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django / Flask / Scrapy
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+instance/
+.webassets-cache
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv / pipenv / poetry / pdm / pixi
+.python-version
+Pipfile.lock
+poetry.lock
+.pdm.toml
+.pdm-python
+.pdm-build/
+.pixi/
+
+# uv
+# Uncomment to ignore uv.lock
+# uv.lock
+
+# PEP 582
+__pypackages__/
+
+# Environments
+.env
+.env.*
+!.env.example
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder / Rope
+.spyderproject
+.spyproject
+.ropeproject
+
+# mkdocs / mypy / Pyre / pytype / Cython
+/site
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+
+# Ruff
+.ruff_cache/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -2,16 +2,16 @@
 sensors:
   cameras:
     left_camera:
-      device_id: "218722270092"
+      device_id: "352122273468"
     front_camera:
-      device_id: "336222076815"
+      device_id: "037522250599"
     right_camera:
-      device_id: "218622276072"
+      device_id: "352122272526"
 
 # robot info
 robot:
   _target_: gello.robots.yam.YAMRobot
-  channel: can_left
+  channel: can_leader_l
 agent:
   _target_: gello.agents.gello_agent.GelloAgent
   port: /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAO9WPU-if00-port0
@@ -26,6 +26,7 @@ hz: 30
 max_steps: 1000
 
 # Data collection configuration
+# TODO add a flag to selectively save the data or not
 collection:
   max_episode_length: 10000
   act_noise_std: 0.001
@@ -36,10 +37,10 @@ collection:
 # Data storage configuration
 storage:
   episodes: 100
-  base_dir: "/media/sean/Samsung980"
-  task_directory: "put_on_the_cap"
-  language_instruction: "Sort the candy"
-  teleop_device: "gello" # ["oculus", "keyboard", "gello", "none"]
+  base_dir: "/home/kostas-lab/projects/YAM"
+  task_directory: "shirt"
+  language_instruction: 'Put the can into the basket'
+  teleop_device: "oculus" # ["oculus", "keyboard", "gello", "none"]
   save_format: "json" # ["json", "npy"]
   saver_max_workers: 2
   png_compress_level: 1
@@ -48,7 +49,7 @@ storage:
 # LeRobot conversion + upload pipeline
 lerobot:
   auto_convert: true
-  auto_upload: true
+  auto_upload: false
   hf_repo_id: "williamtsai726/put_on_the_cap_0329"
   delete_local_after_upload: true
   fps: 30
@@ -64,4 +65,53 @@ lerobot:
 # Policy configuration
 policy:
   type: "pi05"
-  checkpoint_path: "Jiafei1224/pi-snack"
+  repo_id: "williamtsai726/add_milk_to_the_coffee_0326"
+  # checkpoint_path: "Jiafei1224/pi-snack"
+  checkpoint_path: "lerobot/pi05_base"
+
+# Eval session configuration (used by launch_yaml_eval_molmoact.py)
+eval:
+  live_view_enabled: true        # show the 3-pane cv2 window during rollouts
+  # How to run inference:
+  #   server -> POST observations to a remote FastAPI MolmoAct server (default)
+  #   local  -> load the MolmoAct checkpoint in-process via transformers
+  # when mode == server. Accepts either:
+  #   - a full URL (e.g. "https://<ngrok-subdomain>.ngrok-free.dev")
+  #   - a bare host:port (e.g. "10.102.245.84:8202") -- http:// is assumed
+  # Trailing "/act" is appended automatically if missing.
+
+  # uncomment this 2 lines to use server
+  # mode: server #
+  # molmoact_server: "10.102.245.84:8202"
+  
+  # Used when mode == local. Requires transformers (+ huggingface_hub, PIL,
+  # accelerate, safetensors) installed in the active env. bf16 needs ~10-14 GB
+  # VRAM; fp32 needs ~26 GB. Warmup eats the ~30 s first-call latency at
+  # startup so rollout step 0 isn't slow.
+
+  # uncomment following  lines to use server
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"            # bfloat16 | float16 | float32
+    num_steps: 10                # denoising steps!! 
+    enable_cuda_graph: false
+    warmup: true                # warm up the model with dummy obs
+
+  # Optional camera-server architecture. When enabled=true, the eval launcher
+  # talks to a long-lived camera server over ZMQ instead of opening RealSense
+  # devices itself. Start the server with:
+  #     scripts/start_camera_server.sh configs/yam_left.yaml
+  # The server owns all 3 cameras for the duration of the workstation session;
+  # the eval client pulls a fresh obs only when the policy needs one.
+  camera_server:
+    enabled: true
+    endpoint: "tcp://127.0.0.1:5555"
+    request_timeout_ms: 500
+    max_frame_age_sec: 0.5
+    # PUB stream the live cv2 viewer subscribes to. Decouples viewer rendering
+    # from policy.inference() so the viewer keeps refreshing during inference.
+    pub_endpoint: "tcp://127.0.0.1:5556"
+    recv_timeout_ms: 100
+  # max_steps and lerobot.* are reused from the existing top-level blocks above.
